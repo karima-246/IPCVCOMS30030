@@ -3,14 +3,13 @@ import cv2
 import os
 import sys
 import argparse
-import face
 
-# LOADING THE IMAGE
-parser = argparse.ArgumentParser(description='Convert RGB to GRAY')
-# parser.add_argument('-name', '-n', type=str, default='images/coins2.png')
-# args = parser.parse_args()
+# from skimage import data, color, img_as_ubyte
+# from skimage.feature import canny
+# from skimage.transform import hough_ellipse
+# from skimage.draw import ellipse_perimeter
 
-# ==================================================
+
 def sobelEdge(input):
     # intialise the output using the input
     edgeOutputX = np.zeros([input.shape[0], input.shape[1]], dtype=np.float32)
@@ -32,145 +31,145 @@ def sobelEdge(input):
             edgeOutputY[i, j] = (np.multiply(patch, kernelY)).sum()
     return edgeOutputX, edgeOutputY
 
-def is_circle_fully_in_box(circle, box_coords):
-    cx, cy, r = circle
-    x1, y1 = box_coords[0]
-    x2, y2 = box_coords[1]
-    return (cx - r >= x1) and (cx + r <= x2) and (cy - r >= y1) and (cy + r <= y2)
+def get_edge_map_dir(frame_gray):
+    # apply sobel
+    edgemapX, edgemapY = sobelEdge(frame_gray)
+    # magnitude
+    magnitude = np.sqrt(edgemapX**2 + edgemapY**2)
+    normmagnitude = (magnitude-magnitude.min())/(magnitude.max()-magnitude.min())
+    # orientation
+    anglemap = np.arctan2(edgemapY, edgemapX)
+    # edge
+    edgemap = normmagnitude > 0.2
 
-def circle_box_intersection_ratio(circle, box_coords):
-    cx, cy, r = circle
-    x1, y1 = box_coords[0]
-    x2, y2 = box_coords[1]
+    return anglemap, edgemap
 
-    # Create a grid to approximate intersection area
-    # Use bounding rectangle of circle for efficiency
-    x_min = max(int(cx - r), x1)
-    x_max = min(int(cx + r), x2)
-    y_min = max(int(cy - r), y1)
-    y_max = min(int(cy + r), y2)
+def line_detect(box_coords, edgemap, image,
+                theta_res=np.deg2rad(1),
+                rho_res=1):
 
-    if x_max <= x_min or y_max <= y_min:
-        return 0.0  # no overlap
+    (x1, y1), (x2, y2) = box_coords
 
-    # Create meshgrid of points
-    xx, yy = np.meshgrid(np.arange(x_min, x_max), np.arange(y_min, y_max))
-    # Count points inside circle
-    inside_circle = (xx - cx)**2 + (yy - cy)**2 <= r**2
-    intersection_area = np.sum(inside_circle)
-    circle_area = np.pi * r**2
-    return intersection_area / circle_area
+    # Extract ROI
+    roi = edgemap[y1:y2, x1:x2]
+    H, W = roi.shape
 
-def hough_line_detector(box_coords):
-    x1, y1 = box_coords[0]
-    x2, y2 = box_coords[1]
-    roi = image[y1:y2, x1:x2]
+    # Hough parameter ranges
+    diag_len = int(np.ceil(np.sqrt(H*H + W*W)))
+    rhos = np.arange(-diag_len, diag_len + 1, rho_res)
+    thetas = np.arange(0, np.pi, theta_res)
 
-    # Edge detection in the ROI
-    edges = cv2.Canny(roi, 50, 150, apertureSize=3)
+    accumulator = np.zeros((len(rhos), len(thetas)), dtype=np.float32)
 
-    # Apply Hough Line Transform
-    lines = cv2.HoughLines(edges, 1, np.pi/180, threshold=100)  # adjust threshold
+    # --- MAIN VOTING LOOP ---
+    for y in range(H):
+        for x in range(W):
+            if roi[y, x] > 0:        # edge pixel
+                for ti, theta in enumerate(thetas):
+                    # local rho
+                    rho = x * np.cos(theta) + y * np.sin(theta)
+                    ri = int((rho + diag_len) / rho_res)
+                    accumulator[ri, ti] += 1
 
-    # Draw lines on the original image
-    if lines is not None:
-        for rho_theta in lines:
-            rho, theta = rho_theta[0]
-            a = np.cos(theta)
-            b = np.sin(theta)
-            x0 = a * rho
-            y0 = b * rho
-            # Line endpoints relative to ROI
-            x1 = int(x0 + 1000*(-b)) + x
-            y1 = int(y0 + 1000*(a)) + y
-            x2 = int(x0 - 1000*(-b)) + x
-            y2 = int(y0 - 1000*(a)) + y
-            cv2.line(imagewithcircle, (x1, y1), (x2, y2), (0, 0, 255), 2)
+    # --- EXTRACT PEAKS ---
+    lines = []
+    for ri in range(len(rhos)):
+        for ti in range(len(thetas)):
+            if accumulator[ri, ti] >= threshold_l:
+                rho_local = rhos[ri]
+                theta = thetas[ti]
+
+                # Convert from ROI-local to global rho:
+                # ρ_global = ρ_local + (x1*cosθ + y1*sinθ)
+                rho_global = rho_local + x1*np.cos(theta) + y1*np.sin(theta)
+
+                lines.append((rho_global, theta))
+
+    # --- DRAW LINES ---
+    imagewithline = image
+    for rho, theta in lines:
+        a = np.cos(theta)
+        b = np.sin(theta)
+        x0 = a * rho
+        y0 = b * rho
+
+        x1_line = int(x0 + 2000 * (-b))
+        y1_line = int(y0 + 2000 * (a))
+        x2_line = int(x0 - 2000 * (-b))
+        y2_line = int(y0 - 2000 * (a))
+
+        imagewithline = cv2.line(imagewithline, (x1_line, y1_line), (x2_line, y2_line), color=(255, 0, 0), thickness=2)
+    
+    lines_found = False
+
+    if len(lines) > 0:
+        lines_found = True
+
+    return lines_found, imagewithline
+
+
+def circle_detect(box_coords, edgemap, anglemap, image):
+    (x1, y1), (x2, y2) = box_coords
+    # Extract ROI
+    roi_edge = edgemap[y1:y2, x1:x2]
+    roi_angle = anglemap[y1:y2, x1:x2]
+    # Dimensions of ROI
+    H = y2 - y1
+    W = x2 - x1
+
+    # Create local Hough accumulator for ROI only
+    hough_local = np.zeros([H, W, rmax - rmin + 1], dtype=np.float32)
+    # Hough voting inside ROI
+    for i in range(H):        # y inside ROI
+        for j in range(W):    # x inside ROI
+            if roi_edge[i, j] > 0:  # edge pixel
+                theta = roi_angle[i, j]
+                for r in range(rmin, rmax + 1):
+                    # potential circle centres (local coords)
+                    x_c = (j + np.array([-1, 1]) * r * np.cos(theta)).astype(int)
+                    y_c = (i + np.array([-1, 1]) * r * np.sin(theta)).astype(int)
+
+                    for k in range(2):
+                        if (0 <= x_c[k] < W) and (0 <= y_c[k] < H):
+                            hough_local[y_c[k], x_c[k], r - rmin] += 1
+    # Threshold local Hough accumulator
+    circles_found = False
+    circle_parameters_ls = []
+    for i in range(H):
+        for j in range(W):
+            for k in range(rmax - rmin + 1):
+                if hough_local[i, j, k] >= threshold_c:
+                    # Convert back to GLOBAL image coordinates
+                    cx = j + x1
+                    cy = i + y1
+                    radius = k + rmin
+                    circle_parameters_ls.append([cx, cy, radius])
+                    circles_found = True
+    
+    imagewithcircle = image
+    for circle_parameters in circle_parameters_ls:
+        imagewithcircle = cv2.circle(imagewithcircle,
+                                    (circle_parameters[0], circle_parameters[1]),
+                                    int(circle_parameters[2]),
+                                    color=(255, 0, 0),
+                                    thickness=2)
+    return circles_found, imagewithcircle
+
 
 # ==== MAIN ==============================================
 
-imageName = "Dartboard/dart0.jpg"
+# parameters
 
-# ignore if no such file is present.
-if not os.path.isfile(imageName):
-    print('No such file')
-    sys.exit(1)
+threshold_c = 15
+threshold_l = 110
 
-# Read image from file
-image = cv2.imread(imageName, 1)
-
-# ignore if image is not array.
-if not (type(image) is np.ndarray):
-    print('Not image data')
-    sys.exit(1)
-
-
-boxes = face.guesses
-print(boxes[0])
-
-# CONVERT COLOUR, BLUR AND SAVE
-gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-gray_image = gray_image.astype(np.float32)
-
-# apply sobel
-edgemapX, edgemapY = sobelEdge(gray_image)
-# magnitude
-magnitude = np.sqrt(edgemapX**2 + edgemapY**2)
-normmagnitude = (magnitude-magnitude.min())/(magnitude.max()-magnitude.min())
-# orientation
-anglemap = np.arctan2(edgemapY, edgemapX)
-# edge
-edgemap = normmagnitude > 0.2
-
-rmin = 20
+rmin = 15
 rmax = 100
-# create hough space
-hough3D = np.zeros([image.shape[0], image.shape[1], rmax-rmin+1], dtype=np.float32)
-
-for i in range(0, image.shape[0]):  # go through all rows (or scanlines)
-    for j in range(0, image.shape[1]):
-        # if pixel is an edge (>thr)
-        if edgemap[i, j] > 0:
-            for r in range(rmin, rmax+1):
-                x = (j + np.array([-1, 1])*r*np.cos(anglemap[i, j])).astype(int)
-                y = (i + np.array([-1, 1])*r*np.sin(anglemap[i, j])).astype(int)
-                for k in range(0, 2):
-                    if (y[k] >= 0) and (y[k] < image.shape[0]) and (x[k] >= 0) and (x[k] < image.shape[1]):
-                        # accumulate vote for circle centre
-                        hough3D[y[k], x[k], r-rmin] += 1
 
 
-hough2D = np.sum(hough3D, axis=2)
-
-threshold = 20  # Try to change the threshold
-circle_parameters_ls = []
-for i in range(0, hough3D.shape[0]):
-    for j in range(0, hough3D.shape[1]):
-        for k in range(0, hough3D.shape[2]):
-            if hough3D[i, j, k] >= threshold:
-                circle_parameters_ls.append([j, i, k + rmin])
-# Plot the circles according to the parameters on the original image
-imagewithcircle = image
-for circle_parameters in circle_parameters_ls:
-    imagewithcircle = cv2.circle(imagewithcircle,
-                                 (circle_parameters[0], circle_parameters[1]),
-                                 int(circle_parameters[2]),
-                                 color=(0, 0, 255),
-                                 thickness=2)
-
-boxes = face.guesses
-THR = 60
-
-# for box in boxes:
-#     for idx, circle in enumerate(circle_parameters_ls):
-#         if is_circle_fully_in_box(circle, box) or circle_box_intersection_ratio(circle, box) >= THR:
-#             # apply line detector
-#             hough_line_detector(box)
-
-# -------------------------- change so that you're only checking within the boxes
 
 
-cv2.imwrite("imagewithcircle.jpg", imagewithcircle)
+# cv2.imwrite("imagewithcircle.jpg", imagewithcircle)
 # # save image
 # cv2.imwrite("edgemapX.jpg", (edgemapX-edgemapX.min())/(edgemapX.max()-edgemapX.min())*255)
 # cv2.imwrite("edgemapY.jpg", (edgemapY-edgemapY.min())/(edgemapY.max()-edgemapY.min())*255)
